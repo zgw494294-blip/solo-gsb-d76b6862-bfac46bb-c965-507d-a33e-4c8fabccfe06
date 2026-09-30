@@ -117,6 +117,35 @@ main {
 .rules ul { margin: 0; padding-left: 20px; font-size: 13px; color: var(--ink-soft); }
 .rules li { margin: 2px 0; }
 
+.executed-box {
+  margin: 4px 0 0;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border: 1px solid var(--line);
+  border-left: 4px solid #475569;
+  border-radius: 8px;
+}
+.executed-box h3 { margin: 0 0 6px; font-size: 14px; color: var(--ink); }
+.executed-hint { margin: 0 0 8px; font-size: 12.5px; color: var(--ink-soft); }
+.executed-hint code {
+  background: #eef2f6;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 12px;
+}
+.executed-box input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 14px;
+  background: #fff;
+}
+.executed-box input:focus {
+  outline: 2px solid rgba(71, 85, 105, 0.3);
+  border-color: #475569;
+}
+
 .actions {
   display: flex;
   align-items: center;
@@ -193,6 +222,23 @@ svg#chart {
 }
 .legend .key.line { height: 0; border-top: 3px dashed var(--cap-line); width: 20px; }
 .legend .key.series { height: 0; border-top: 3px solid var(--series); width: 20px; }
+.legend .key.series-exec { height: 0; border-top: 3px solid #475569; width: 20px; }
+
+.seq-exec { color: #475569; }
+.seq-cont { color: var(--series); }
+
+.phase-tag {
+  display: inline-block;
+  font-size: 11.5px;
+  border-radius: 4px;
+  padding: 1px 8px;
+  color: #fff;
+  white-space: nowrap;
+}
+.phase-exec { background: #475569; }
+.phase-cont { background: var(--series); }
+tr.row-exec td { background: #f6f7f9; }
+.window-phase { font-size: 12.5px; color: #475569; }
 
 .windows {
   display: grid;

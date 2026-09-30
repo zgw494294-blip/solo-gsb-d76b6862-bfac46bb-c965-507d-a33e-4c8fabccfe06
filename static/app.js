@@ -44,6 +44,7 @@ const form = document.getElementById("schedule-form");
 const formError = document.getElementById("form-error");
 const submitBtn = document.getElementById("submit-btn");
 const resultBox = document.getElementById("result");
+const executedInput = document.getElementById("executed-input");
 
 function buildRows() {
   materialsBox.innerHTML = "";
@@ -172,6 +173,43 @@ function clientValidate(items) {
   return null;
 }
 
+// 解析已执行档位文本：逗号（中英文）/空白分隔；返回 { values: number[] | null, error: string | null }
+function parseExecuted() {
+  const raw = executedInput.value.trim();
+  if (!raw) return { values: null, error: null };
+  const parts = raw.split(/[,，\s]+/).filter(Boolean);
+  if (parts.length < 1 || parts.length > 20)
+    return { values: null, error: "已执行档位数量必须为 1～20 个。" };
+  const values = [];
+  for (let i = 0; i < parts.length; i++) {
+    const tok = parts[i];
+    if (!/^[+-]?\d+$/.test(tok))
+      return { values: null, error: `已执行记录第 ${i + 1} 档「${tok}」不是整数温度。` };
+    const t = Number(tok);
+    if (t < 20 || t > 200)
+      return { values: null, error: `已执行记录第 ${i + 1} 档温度 ${t}°C 超出允许范围 20～200°C。` };
+    if (t % 10 !== 0)
+      return { values: null, error: `已执行记录第 ${i + 1} 档温度 ${t}°C 不是整十数。` };
+    values.push(t);
+  }
+  // 相邻（含初态 20°C）温差 ≤ 20，逐档给出首个违规档
+  let prev = 20;
+  for (let i = 0; i < values.length; i++) {
+    if (Math.abs(values[i] - prev) > 20)
+      return {
+        values: null,
+        error: `已执行记录第 ${i + 1} 档温度 ${values[i]}°C 与上一档 ${prev}°C 温差 ${Math.abs(values[i] - prev)}°C，超过 20°C 上限。`,
+      };
+    prev = values[i];
+  }
+  return { values, error: null };
+}
+
+executedInput.addEventListener("input", () => {
+  clearResult();
+  formError.hidden = true;
+});
+
 // ---------- 提交求解 ----------
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -183,6 +221,15 @@ form.addEventListener("submit", async (ev) => {
     showFormError(err);
     return;
   }
+  const { values: executed, error: execErr } = parseExecuted();
+  if (execErr) {
+    clearResult();
+    showFormError(execErr);
+    return;
+  }
+
+  const body = { materials: items };
+  if (executed) body.executedTemperatures = executed;
 
   submitBtn.disabled = true;
   submitBtn.textContent = "求解中…";
@@ -190,7 +237,7 @@ form.addEventListener("submit", async (ev) => {
     const resp = await fetch("/api/schedule", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ materials: items }),
+      body: JSON.stringify(body),
     });
     const data = await resp.json();
     if (!resp.ok) {
@@ -246,12 +293,30 @@ function renderSummary(data) {
   box.appendChild(kv("总档数", `${data.stepCount} 档（≤ 20）`));
   box.appendChild(kv("总时长", `${data.totalMinutes} 分钟`));
   box.appendChild(kv("耐受上限（取所有材料最小值）", `${data.toleranceCap}°C`));
+  if (data.hasExecuted) {
+    box.appendChild(kv("已执行档位", `${data.executedCount} 档（${data.executedCount * 5} 分钟）`));
+    if (data.alreadyComplete) {
+      box.appendChild(kv("后续编排", "0 档（已全部达标且回到 20°C，无需续排）"));
+    } else {
+      box.appendChild(kv("后续档位", `${data.continuationCount} 档（${data.continuationMinutes} 分钟）`));
+    }
+  }
   const seq = el("div", { class: "kv" });
-  seq.appendChild(el("span", { textContent: "温度序列：" }));
+  seq.appendChild(el("span", { textContent: "完整温度序列：" }));
   seq.appendChild(el("code", { textContent: data.temperatures.join(" → ") + " °C" }));
   box.appendChild(seq);
+  if (data.hasExecuted && !data.alreadyComplete) {
+    const seqE = el("div", { class: "kv" });
+    seqE.appendChild(el("span", { textContent: "已执行：" }));
+    seqE.appendChild(el("code", { class: "seq-exec", textContent: data.executedTemperatures.join(" → ") + " °C" }));
+    box.appendChild(seqE);
+    const seqC = el("div", { class: "kv" });
+    seqC.appendChild(el("span", { textContent: "后续编排：" }));
+    seqC.appendChild(el("code", { class: "seq-cont", textContent: data.continuationTemperatures.join(" → ") + " °C" }));
+    box.appendChild(seqC);
+  }
   box.appendChild(
-    el("div", { class: "kv", textContent: "已满足：档数最少；同档数下温度序列字典序最小。" })
+    el("div", { class: "kv", textContent: "已满足：总档数最少；同档数下后续温度序列字典序最小。" })
   );
 }
 
@@ -262,6 +327,7 @@ function kv(k, v) {
 function renderWindows(data) {
   const box = document.getElementById("windows");
   box.innerHTML = "";
+  const boundary = data.executedCount || 0;
   data.windows.forEach((w, i) => {
     const color = PALETTE[i % PALETTE.length];
     const card = el("div", {
@@ -275,6 +341,13 @@ function renderWindows(data) {
     card.appendChild(
       el("p", {}, document.createTextNode("区间温度："), el("span", { class: "temps", textContent: w.temperatures.join(" → ") + " °C" }))
     );
+    if (boundary > 0) {
+      let phaseText;
+      if (w.endStep <= boundary) phaseText = "该区间全部位于已执行档位中。";
+      else if (w.startStep > boundary) phaseText = "该区间全部位于后续档位中。";
+      else phaseText = `该区间横跨已执行（第 1～${boundary} 档）与后续档位。`;
+      card.appendChild(el("p", { class: "window-phase", textContent: phaseText }));
+    }
     box.appendChild(card);
   });
 
@@ -292,7 +365,10 @@ function renderWindows(data) {
 
 function renderSteps(data) {
   const tbody = document.querySelector("#steps-table tbody");
+  const thPhase = document.getElementById("th-phase");
   tbody.innerHTML = "";
+  thPhase.hidden = !data.hasExecuted;
+
   data.windows.forEach((w, i) => {
     // 仅为建立 材料名->颜色 的对应（颜色顺序与 windows 一致）
     w.__color = PALETTE[i % PALETTE.length];
@@ -300,8 +376,18 @@ function renderSteps(data) {
   const colorOf = new Map(data.windows.map((w) => [w.material, w.__color]));
 
   data.steps.forEach((st) => {
-    const tr = el("tr");
+    const tr = el("tr", { class: st.executed ? "row-exec" : "row-cont" });
     tr.appendChild(el("td", { textContent: String(st.index) }));
+    if (data.hasExecuted) {
+      tr.appendChild(
+        el("td", {},
+          el("span", {
+            class: st.executed ? "phase-tag phase-exec" : "phase-tag phase-cont",
+            textContent: st.executed ? "已执行" : "后续",
+          })
+        )
+      );
+    }
     tr.appendChild(el("td", { textContent: String(st.temperature) }));
     tr.appendChild(el("td", { textContent: String(st.minutes) }));
     const delta = el("td", { textContent: st.deltaFromPrev === 0 ? "0" : (st.deltaFromPrev > 0 ? `+${st.deltaFromPrev}` : `${st.deltaFromPrev}`) });
@@ -340,8 +426,19 @@ function renderLegend(data) {
   });
   ul.appendChild(el("li", {}, el("span", { class: "key line" }),
     document.createTextNode(`耐受上限 ${data.toleranceCap}°C（所有档位不得超过）`)));
-  ul.appendChild(el("li", {}, el("span", { class: "key series" }),
-    document.createTextNode("设定温度曲线（第 0 点为初态 20°C，末档回到 20°C）")));
+  if (data.hasExecuted) {
+    ul.appendChild(el("li", {}, el("span", { class: "key series-exec" }),
+      document.createTextNode("已执行档位曲线")));
+    if (!data.alreadyComplete) {
+      ul.appendChild(el("li", {}, el("span", { class: "key series" }),
+        document.createTextNode("后续编排曲线（接续已执行末档，末档回到 20°C）")));
+    } else {
+      ul.appendChild(el("li", {}, document.createTextNode("已全部达标且回到 20°C，后续为空。")));
+    }
+  } else {
+    ul.appendChild(el("li", {}, el("span", { class: "key series" }),
+      document.createTextNode("设定温度曲线（第 0 点为初态 20°C，末档回到 20°C）")));
+  }
 }
 
 // ---------- SVG 曲线 ----------
@@ -408,11 +505,43 @@ function renderChart(data) {
     svg.appendChild(txt);
   }
 
-  // 主曲线（含初态点）
-  svg.appendChild(svgEl("polyline", {
-    points: full.map((t, k) => `${x(k)},${y(t)}`).join(" "),
-    fill: "none", stroke: "#c2410c", "stroke-width": 2, "stroke-linejoin": "round",
-  }));
+  // 主曲线（含初态点）：已执行段与后续段分色
+  const boundary = data.executedCount || 0; // 已执行档数（分界点位于 full 的该下标）
+  const pts = full.map((t, k) => `${x(k)},${y(t)}`);
+  if (data.hasExecuted && boundary < n) {
+    svg.appendChild(svgEl("polyline", {
+      points: pts.slice(0, boundary + 1).join(" "),
+      fill: "none", stroke: "#475569", "stroke-width": 2.4,
+      "stroke-linejoin": "round", "stroke-linecap": "round",
+    }));
+    svg.appendChild(svgEl("polyline", {
+      points: pts.slice(boundary).join(" "),
+      fill: "none", stroke: "#c2410c", "stroke-width": 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round",
+    }));
+    // 已执行 / 后续 分界
+    svg.appendChild(svgEl("line", {
+      x1: x(boundary), x2: x(boundary), y1: M.t, y2: M.t + ph,
+      stroke: "#94a3b8", "stroke-width": 1, "stroke-dasharray": "4 4",
+    }));
+    const divLab = svgEl("text", {
+      x: x(boundary), y: M.t - 8, "text-anchor": "middle",
+      "font-size": 10, fill: "#64748b",
+    });
+    divLab.textContent = "已执行 ｜ 后续";
+    svg.appendChild(divLab);
+  } else if (data.hasExecuted) {
+    // 全部为已执行档位（已达标且回到 20°C，后续为空）
+    svg.appendChild(svgEl("polyline", {
+      points: pts.join(" "),
+      fill: "none", stroke: "#475569", "stroke-width": 2.4, "stroke-linejoin": "round",
+    }));
+  } else {
+    svg.appendChild(svgEl("polyline", {
+      points: pts.join(" "),
+      fill: "none", stroke: "#c2410c", "stroke-width": 2, "stroke-linejoin": "round",
+    }));
+  }
 
   // 各材料达标区间加粗覆盖
   data.windows.forEach((w, i) => {
@@ -431,8 +560,10 @@ function renderChart(data) {
 
   // 所有档位点 + 温度标注
   for (let k = 1; k <= n; k++) {
+    const isExec = data.hasExecuted && k <= boundary;
     svg.appendChild(svgEl("circle", {
-      cx: x(k), cy: y(full[k]), r: 3, fill: "#b91c1c",
+      cx: x(k), cy: y(full[k]), r: 3,
+      fill: isExec ? "#475569" : "#b91c1c",
     }));
     const lab = svgEl("text", {
       x: x(k), y: y(full[k]) - 7, "text-anchor": "middle",

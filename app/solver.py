@@ -9,10 +9,18 @@
 - 材料一旦达标即视为完成，后续不再要求保温。
 
 求 20 档以内的最短完整曲线；等长时取温度序列字典序最小。
+
+续炉判定：可给定 1～20 个「已执行」档位（executed）。已执行记录按
+温度范围、整十度、相邻（含初态）≤20°C 温差、所有材料耐受上限逐档核验，
+首个违规档即判记录非法，不予续排。合法记录逐档累计各材料连续保温进度：
+离开区间则未达标进度归零，已达标者保持达标；记录中途回到 20°C 也允许
+继续。随后以最后已执行温度为起点、已用档数计入 20 档上限，搜索最短且
+回到 20°C 的后续曲线。
 """
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 
@@ -106,26 +114,84 @@ def _advance(progress: tuple[int, ...], temp: int, materials: list[Material]):
     return tuple(nxt)
 
 
-def _bfs(materials: list[Material]):
-    """按档数升序、同档数按温度序列字典序升序搜索最短曲线。"""
+def replay_executed(
+    executed: list[int], materials: list[Material]
+) -> tuple[int, tuple[int, ...], list[int]]:
+    """逐档核验已执行记录并模拟连续保温进度。
+
+    返回 (最后一个已执行温度, 各材料当前进度, 规范化为整数的温度列表)；
+    进度 -1 表示已达标。首个违规档即抛出 ValueError（1-based 档位编号），
+    不给出任何续排。
+    """
+    if not (1 <= len(executed) <= MAX_STEPS):
+        raise ValueError(f"已执行档位数量必须为 1～{MAX_STEPS} 个。")
+
+    cap = min(m.tolerance for m in materials)
+    prev = INIT_TEMP
+    progress = tuple([0] * len(materials))
+    normed: list[int] = []
+
+    for i, raw in enumerate(executed, start=1):
+        # 接受整数值（含 JSON 中数值为整数的 40.0）；拒绝布尔、非数值与小数
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"已执行记录第 {i} 档温度必须为整数（整十数）。")
+        if not math.isfinite(raw) or float(raw) != int(raw):
+            raise ValueError(f"已执行记录第 {i} 档温度 {raw}°C 必须为整数。")
+        t = int(raw)
+        if not (INIT_TEMP <= t <= MAX_TEMP):
+            raise ValueError(
+                f"已执行记录第 {i} 档温度 {t}°C 超出允许范围 "
+                f"{INIT_TEMP}～{MAX_TEMP}°C。"
+            )
+        if t % TEMP_STEP != 0:
+            raise ValueError(f"已执行记录第 {i} 档温度 {t}°C 不是整十数。")
+        if abs(t - prev) > MAX_RAMP:
+            raise ValueError(
+                f"已执行记录第 {i} 档温度 {t}°C 与上一档 {prev}°C 温差 "
+                f"{abs(t - prev)}°C，超过 {MAX_RAMP}°C 上限。"
+            )
+        if t > cap:
+            raise ValueError(
+                f"已执行记录第 {i} 档温度 {t}°C 超过所有材料耐受上限的最小值 "
+                f"{cap}°C。"
+            )
+        progress = _advance(progress, t, materials)
+        prev = t
+        normed.append(t)
+
+    return prev, progress, normed
+
+
+def _bfs(
+    materials: list[Material],
+    start_temp: int = INIT_TEMP,
+    start_progress: tuple[int, ...] | None = None,
+    used_steps: int = 0,
+) -> list[int] | None:
+    """按档数升序、同档数按温度序列字典序升序搜索最短曲线。
+
+    可从已执行记录的 (start_temp, start_progress, used_steps) 接续搜索，
+    返回的仅为后续档位；总档数（已执行 + 后续）不得超过 MAX_STEPS。
+    """
     n = len(materials)
     cap = min(m.tolerance for m in materials)
     # 候选温度：20..cap 的整十数（cap 本身为整十数）
     temps = list(range(INIT_TEMP, cap + 1, TEMP_STEP))
 
-    start_progress = tuple([0] * n)
-    # 状态 = (当前温度, 连续保温进度)；首档从初态 20°C 出发
-    start_state = (INIT_TEMP, start_progress)
+    if start_progress is None:
+        start_progress = tuple([0] * n)
+    # 状态 = (当前温度, 连续保温进度)
+    start_state = (start_temp, start_progress)
     seen: set = {start_state}
-    # 队列元素：(state, parent, chosen_temp, depth)
-    queue = deque([(start_state, None, None, 0)])
+    # 队列元素：(state, parent, chosen_temp, depth)，depth 为总档数
+    queue = deque([(start_state, None, None, used_steps)])
 
     goal = None
     while queue:
         state, parent, chosen, depth = queue.popleft()
         cur_temp, progress = state
 
-        # 末档必须为 20°C；首档不允许空曲线
+        # 末档必须为 20°C；必须至少有一个已执行档位
         if depth >= 1 and cur_temp == INIT_TEMP and all(p < 0 for p in progress):
             goal = (state, parent, chosen, depth)
             break
@@ -190,32 +256,15 @@ def _first_windows(seq: list[int], materials: list[Material]) -> list[dict]:
     return windows
 
 
-def solve(materials: list[Material]) -> dict:
-    """求解入口。返回 {solvable: bool, ...}，永不抛参数以外的异常。"""
-    validate_materials(materials)
-    # 补默认名称
-    materials = [
-        Material(
-            name=m.name.strip() or f"材料{i + 1}",
-            hold_low=m.hold_low,
-            hold_high=m.hold_high,
-            duration=m.duration,
-            tolerance=m.tolerance,
-        )
-        for i, m in enumerate(materials)
-    ]
-
-    reason = _precheck(materials)
-    if reason is not None:
-        return {"solvable": False, "reason": reason}
-
-    seq = _bfs(materials)
-    if seq is None:
-        return {
-            "solvable": False,
-            "reason": f"在 {MAX_STEPS} 档以内找不到满足全部约束并回到 20°C 的完整曲线。",
-        }
-
+def _build_result(
+    materials: list[Material],
+    seq: list[int],
+    executed: list[int] | None = None,
+) -> dict:
+    """由完整曲线（已执行 + 后续）组装返回结构。"""
+    executed = executed or []
+    exec_count = len(executed)
+    continuation = seq[exec_count:]
     windows = _first_windows(seq, materials)
 
     # 被两个及以上材料保温区间共用的档位
@@ -228,6 +277,7 @@ def solve(materials: list[Material]) -> dict:
     steps = []
     prev = INIT_TEMP
     for i, t in enumerate(seq, start=1):
+        is_executed = i <= exec_count
         steps.append(
             {
                 "index": i,
@@ -236,11 +286,13 @@ def solve(materials: list[Material]) -> dict:
                 "deltaFromPrev": t - prev,
                 "inWindow": sorted(used_by.get(i, [])),
                 "shared": i in shared_steps,
+                "executed": is_executed,
+                "phase": "executed" if is_executed else "continuation",
             }
         )
         prev = t
 
-    return {
+    result = {
         "solvable": True,
         "temperatures": seq,
         "stepCount": len(seq),
@@ -262,3 +314,76 @@ def solve(materials: list[Material]) -> dict:
             for m in materials
         ],
     }
+    if exec_count > 0:
+        result.update(
+            {
+                "hasExecuted": True,
+                "executedTemperatures": list(executed),
+                "continuationTemperatures": continuation,
+                "executedCount": exec_count,
+                "continuationCount": len(continuation),
+                "continuationMinutes": len(continuation) * STEP_MINUTES,
+                "alreadyComplete": len(continuation) == 0,
+            }
+        )
+    else:
+        result.update(
+            {
+                "hasExecuted": False,
+                "executedTemperatures": [],
+                "continuationTemperatures": continuation,
+                "executedCount": 0,
+                "continuationCount": len(continuation),
+                "continuationMinutes": len(continuation) * STEP_MINUTES,
+                "alreadyComplete": False,
+            }
+        )
+    return result
+
+
+def solve(materials: list[Material], executed: list[int] | None = None) -> dict:
+    """求解入口。返回 {solvable: bool, ...}，永不抛参数以外的异常。"""
+    validate_materials(materials)
+    # 补默认名称
+    materials = [
+        Material(
+            name=m.name.strip() or f"材料{i + 1}",
+            hold_low=m.hold_low,
+            hold_high=m.hold_high,
+            duration=m.duration,
+            tolerance=m.tolerance,
+        )
+        for i, m in enumerate(materials)
+    ]
+
+    if executed:
+        # 已执行记录逐档核验：非法记录直接抛错（路由层转 422），不展示部分方案
+        last_temp, progress, executed = replay_executed(list(executed), materials)
+        cont = _bfs(
+            materials,
+            start_temp=last_temp,
+            start_progress=progress,
+            used_steps=len(executed),
+        )
+        if cont is None:
+            return {
+                "solvable": False,
+                "reason": (
+                    f"已执行 {len(executed)} 档后，在 {MAX_STEPS} 档总上限内找不到"
+                    "满足剩余材料并回到 20°C 的后续曲线，无法续排。"
+                ),
+            }
+        return _build_result(materials, list(executed) + cont, list(executed))
+
+    reason = _precheck(materials)
+    if reason is not None:
+        return {"solvable": False, "reason": reason}
+
+    seq = _bfs(materials)
+    if seq is None:
+        return {
+            "solvable": False,
+            "reason": f"在 {MAX_STEPS} 档以内找不到满足全部约束并回到 20°C 的完整曲线。",
+        }
+
+    return _build_result(materials, seq)
